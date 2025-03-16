@@ -1,0 +1,4 @@
+github.com/mxmauro/go-rundownprotection v1.2.1 h1:83izhjNZ8gh7kGphufB0jliEqEpX7l4T+QTnEmLmyIk=
+github.com/mxmauro/go-rundownprotection v1.2.1/go.mod h1:mNKGszJg1OtyFooXJX5SXm+etcVSzveRi+1AjK3Xw1w=
+github.com/mxmauro/resetevent v0.1.2 h1:6NeF/2v0bWDVVuXdl5o5Y4yXR9T24MppXvURMhNHuWk=
+github.com/mxmauro/resetevent v0.1.2/go.mod h1:ROHItKURwt5mvdzFUR165S2fGtrVV3PffPYIITmrzhA=
