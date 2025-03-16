@@ -47,8 +47,8 @@ type Job struct {
 	fn JobRoutine
 }
 
-// JobRoutine defines the callback function to run when the job is ready for execution.
-type JobRoutine func(ctx context.Context, jobID string)
+// JobRoutine defines the callback function to run when the job is ready for execution. workerNo starts from 1.
+type JobRoutine func(ctx context.Context, workerNo int, jobID string)
 
 // CanceledJobCallback defines the function to call if a queued job is not executed due to the pool being stopped.
 type CanceledJobCallback func(jobID string)
@@ -119,7 +119,7 @@ func (p *Pool) Stop() {
 
 		// Cancel pending jobs on the main queue
 		for {
-			job, ok := p.popJob()
+			job, ok := p.popJobNoLock() // No need to lock because no other routine accessing it
 			if !ok {
 				break // End the loop if no more jobs
 			}
@@ -207,7 +207,7 @@ func (p *Pool) worker(workerID int) {
 			return
 
 		case job := <-p.workerJobQueue[workerID]:
-			job.fn(p.rp, job.id)
+			job.fn(p.rp, workerID+1, job.id)
 
 			// Queue this worker as idle if we are still running
 			if p.rp.Acquire() {
@@ -222,6 +222,10 @@ func (p *Pool) popJob() (Job, bool) {
 	p.jobsListMtx.Lock()
 	defer p.jobsListMtx.Unlock()
 
+	return p.popJobNoLock()
+}
+
+func (p *Pool) popJobNoLock() (Job, bool) {
 	elem := p.jobsList.Front()
 	if elem == nil {
 		return Job{}, false

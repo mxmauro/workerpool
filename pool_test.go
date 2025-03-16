@@ -25,7 +25,7 @@ func TestPool(t *testing.T) {
 	startTime := time.Now()
 	for i := 1; i <= 16; i++ {
 		jobID := strconv.Itoa(i)
-		pool.QueueJob(jobID, func(ctx context.Context, jobID string) {
+		pool.QueueJob(jobID, func(ctx context.Context, workerNo int, jobID string) {
 			jID, _ := strconv.Atoi(jobID)
 			jobExecuted[jID-1] = true
 
@@ -36,7 +36,7 @@ func TestPool(t *testing.T) {
 			}
 			dt := time.Since(startTime)
 
-			t.Log("Running job", jobID, "after", strconv.FormatInt(dt.Milliseconds(), 10)+"ms")
+			t.Log("Running job", jobID, "at worker", "#"+strconv.Itoa(workerNo), "after", strconv.FormatInt(dt.Milliseconds(), 10)+"ms")
 			select {
 			case <-ctx.Done():
 			case <-time.After(toWait):

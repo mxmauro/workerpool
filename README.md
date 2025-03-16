@@ -24,7 +24,7 @@ func main() {
 	defer pool.Stop()
 
 	for i := 1; i <= 16; i++ {
-		pool.QueueJob(strconv.Itoa(i), func(ctx context.Context, jobID string) {
+		pool.QueueJob(strconv.Itoa(i), func(ctx context.Context, workerNo int, jobID string) {
 			// Job "i" is running
 			// You can check for context cancelation and return earlier
 
