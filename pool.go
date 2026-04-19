@@ -3,6 +3,7 @@ package workerpool
 import (
 	"container/list"
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 
@@ -17,11 +18,14 @@ type Options struct {
 	// Concurrency is the maximum amount of simultaneous jobs to run. If zero, defaults to runtime.GOMAXPROCS(0).
 	Concurrency int
 
-	// MaxCapacity defines the maximum amount of jobs that can be queued. Zero for infinite.
+	// MaxCapacity defines the maximum amount of jobs that can be queued. Zero or less for infinite.
 	MaxCapacity int
 
 	// OnCanceledJob is a function to call if a queued job is not executed due to the pool being stopped.
 	OnCanceledJob CanceledJobCallback
+
+	// OnJobPanic is a function to call if a job panics. If nil, the panic is rethrown.
+	OnJobPanic JobPanicCallback
 }
 
 // Pool defines a worker pool job queue and scheduler.
@@ -29,9 +33,11 @@ type Pool struct {
 	rp           *rundownprotection.RundownProtection
 	wg           sync.WaitGroup
 	shutdownSync sync.Once
+	shutdownDone chan struct{}
 
 	maxCapacity   int
 	onCanceledJob CanceledJobCallback
+	onJobPanic    JobPanicCallback
 
 	jobsListMtx     sync.Mutex
 	jobsList        *list.List
@@ -53,15 +59,32 @@ type JobRoutine func(ctx context.Context, workerNo int, jobID string)
 // CanceledJobCallback defines the function to call if a queued job is not executed due to the pool being stopped.
 type CanceledJobCallback func(jobID string)
 
+// JobPanicCallback defines the function to call if a queued job panics.
+type JobPanicCallback func(jobID string, recovered any)
+
 // -----------------------------------------------------------------------------
 
+var (
+	// ErrPoolStopped is returned when a job is queued while the pool is stopping.
+	ErrPoolStopped = errors.New("workerpool: pool is stopping")
+
+	// ErrQueueFull is returned when a job cannot be queued because the pending queue reached MaxCapacity.
+	ErrQueueFull = errors.New("workerpool: queue is full")
+
+	// ErrNilJob is returned when a nil job routine is submitted.
+	ErrNilJob = errors.New("workerpool: job routine is nil")
+)
+
+// -----------------------------------------------------------------------------
+
+// New creates a worker pool and starts its workers and scheduler.
 func New(opts Options) *Pool {
 	// Validate and sanitize options
 	if opts.Concurrency < 1 {
 		opts.Concurrency = runtime.GOMAXPROCS(0)
 	}
 	if opts.MaxCapacity < 0 {
-		opts.MaxCapacity = opts.Concurrency
+		opts.MaxCapacity = 0
 	}
 
 	// Create pool
@@ -69,9 +92,11 @@ func New(opts Options) *Pool {
 		rp:           rundownprotection.Create(),
 		wg:           sync.WaitGroup{},
 		shutdownSync: sync.Once{},
+		shutdownDone: make(chan struct{}),
 
 		maxCapacity:   opts.MaxCapacity,
 		onCanceledJob: opts.OnCanceledJob,
+		onJobPanic:    opts.OnJobPanic,
 
 		jobsListMtx:     sync.Mutex{},
 		jobsList:        list.New(),
@@ -94,49 +119,41 @@ func New(opts Options) *Pool {
 	return &p
 }
 
+// Stop starts pool shutdown and waits until it completes.
 func (p *Pool) Stop() {
-	p.shutdownSync.Do(func() {
-		// Initiate shutdown
-		p.rp.Wait()
-		p.wg.Wait()
-
-		// Cancel jobs that were queued in a worker queue but not executed yet and close channels
-		for _, ch := range p.workerJobQueue {
-			// and
-			if p.onCanceledJob != nil {
-				for loop := true; loop; {
-					select {
-					case job := <-ch:
-						p.onCanceledJob(job.id)
-					default:
-						loop = false
-					}
-				}
-			}
-
-			close(ch)
-		}
-
-		// Cancel pending jobs on the main queue
-		for {
-			job, ok := p.popJobNoLock() // No need to lock because no other routine accessing it
-			if !ok {
-				break // End the loop if no more jobs
-			}
-			if p.onCanceledJob != nil {
-				p.onCanceledJob(job.id)
-			}
-		}
-
-		// Misc cleanup
-		close(p.idleQueue)
-
-	})
+	_ = p.StopContext(context.Background())
 }
 
+// StopContext starts pool shutdown and waits until it completes or ctx is done.
+func (p *Pool) StopContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	p.shutdownSync.Do(func() {
+		go p.shutdown()
+	})
+
+	select {
+	case <-p.shutdownDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// QueueJob adds a job to the pool and returns false if it is rejected.
 func (p *Pool) QueueJob(id string, fn JobRoutine) bool {
+	return p.QueueJobErr(id, fn) == nil
+}
+
+// QueueJobErr adds a job to the pool and returns a typed error if it is rejected.
+func (p *Pool) QueueJobErr(id string, fn JobRoutine) error {
+	if fn == nil {
+		return ErrNilJob
+	}
 	if !p.rp.Acquire() {
-		return false
+		return ErrPoolStopped
 	}
 	defer p.rp.Release()
 
@@ -144,7 +161,7 @@ func (p *Pool) QueueJob(id string, fn JobRoutine) bool {
 	p.jobsListMtx.Lock()
 	if p.maxCapacity > 0 && p.jobsList.Len() >= p.maxCapacity {
 		p.jobsListMtx.Unlock()
-		return false
+		return ErrQueueFull
 	}
 	p.jobsList.PushBack(Job{
 		id: id,
@@ -154,7 +171,7 @@ func (p *Pool) QueueJob(id string, fn JobRoutine) bool {
 	p.jobsAvailableEv.Set()
 
 	// Done
-	return true
+	return nil
 }
 
 func (p *Pool) scheduler() {
@@ -206,8 +223,11 @@ func (p *Pool) worker(workerID int) {
 		case <-p.rp.Done():
 			return
 
-		case job := <-p.workerJobQueue[workerID]:
-			job.fn(p.rp, workerID+1, job.id)
+		case job, ok := <-p.workerJobQueue[workerID]:
+			if !ok {
+				return
+			}
+			p.runJob(workerID, job)
 
 			// Queue this worker as idle if we are still running
 			if p.rp.Acquire() {
@@ -235,4 +255,44 @@ func (p *Pool) popJobNoLock() (Job, bool) {
 	// Get a job
 	job := elem.Value.(Job)
 	return job, true
+}
+
+func (p *Pool) runJob(workerID int, job Job) {
+	if p.onJobPanic == nil {
+		job.fn(p.rp, workerID+1, job.id)
+		return
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			p.onJobPanic(job.id, recovered)
+		}
+	}()
+
+	job.fn(p.rp, workerID+1, job.id)
+}
+
+func (p *Pool) shutdown() {
+	defer close(p.shutdownDone)
+
+	// Initiate shutdown
+	p.rp.Wait()
+	p.wg.Wait()
+
+	// Cancel pending jobs on the main queue.
+	for {
+		job, ok := p.popJobNoLock() // No need to lock because no other routine accesses it now.
+		if !ok {
+			break
+		}
+		if p.onCanceledJob != nil {
+			p.onCanceledJob(job.id)
+		}
+	}
+
+	// Misc cleanup
+	close(p.idleQueue)
+	for _, ch := range p.workerJobQueue {
+		close(ch)
+	}
 }
