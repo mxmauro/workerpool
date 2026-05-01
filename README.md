@@ -45,8 +45,10 @@ func main() {
 
 - `QueueJob` preserves the original `bool` API for simple callers.
 - `QueueJobErr` returns `ErrPoolStopped`, `ErrQueueFull`, or `ErrNilJob` for callers that need to distinguish failures.
+- `Concurrency()`, `MaxCapacity()`, and `PendingJobs()` expose the configured worker count and current queue depth.
 - `Stop()` waits until running jobs return.
 - `StopContext(ctx)` lets callers bound shutdown time if jobs do not return promptly.
+- `Done()` is closed only when shutdown fully completes, which is useful if `StopContext(ctx)` returns because `ctx` expired first.
 
 ## LICENSE
 

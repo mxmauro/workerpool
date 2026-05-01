@@ -30,6 +30,8 @@ type Options struct {
 
 // Pool defines a worker pool job queue and scheduler.
 type Pool struct {
+	_ noCopy
+
 	rp           *rundownprotection.RundownProtection
 	wg           sync.WaitGroup
 	shutdownSync sync.Once
@@ -61,6 +63,14 @@ type CanceledJobCallback func(jobID string)
 
 // JobPanicCallback defines the function to call if a queued job panics.
 type JobPanicCallback func(jobID string, recovered any)
+
+// -----------------------------------------------------------------------------
+
+// noCopy helps go vet detect accidental copies of synchronization state.
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
 
 // -----------------------------------------------------------------------------
 
@@ -140,6 +150,29 @@ func (p *Pool) StopContext(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// Done returns a channel that is closed when pool shutdown fully completes.
+func (p *Pool) Done() <-chan struct{} {
+	return p.shutdownDone
+}
+
+// Concurrency returns the configured amount of workers.
+func (p *Pool) Concurrency() int {
+	return len(p.workerJobQueue)
+}
+
+// MaxCapacity returns the configured queue capacity. Zero means unlimited.
+func (p *Pool) MaxCapacity() int {
+	return p.maxCapacity
+}
+
+// PendingJobs returns the amount of jobs waiting in the queue.
+func (p *Pool) PendingJobs() int {
+	p.jobsListMtx.Lock()
+	defer p.jobsListMtx.Unlock()
+
+	return p.jobsList.Len()
 }
 
 // QueueJob adds a job to the pool and returns false if it is rejected.

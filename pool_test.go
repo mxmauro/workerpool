@@ -90,6 +90,68 @@ func TestQueueJobErrRejectsNilJob(t *testing.T) {
 	}
 }
 
+func TestPoolReportsConfiguredState(t *testing.T) {
+	pool := workerpool.New(workerpool.Options{
+		Concurrency: 3,
+		MaxCapacity: 5,
+	})
+	defer pool.Stop()
+
+	if got := pool.Concurrency(); got != 3 {
+		t.Fatalf("unexpected concurrency: %d", got)
+	}
+	if got := pool.MaxCapacity(); got != 5 {
+		t.Fatalf("unexpected max capacity: %d", got)
+	}
+	if got := pool.PendingJobs(); got != 0 {
+		t.Fatalf("unexpected pending jobs: %d", got)
+	}
+}
+
+func TestPoolReportsPendingJobs(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	pool := workerpool.New(workerpool.Options{
+		Concurrency: 1,
+		MaxCapacity: 4,
+	})
+	defer pool.Stop()
+
+	if err := pool.QueueJobErr("running", func(ctx context.Context, workerNo int, jobID string) {
+		close(started)
+		<-release
+	}); err != nil {
+		t.Fatalf("queue running job: %v", err)
+	}
+
+	<-started
+
+	for i := 0; i < 3; i++ {
+		jobID := "queued-" + strconv.Itoa(i)
+		if err := pool.QueueJobErr(jobID, func(ctx context.Context, workerNo int, jobID string) {}); err != nil {
+			t.Fatalf("queue %s: %v", jobID, err)
+		}
+	}
+
+	if got := pool.PendingJobs(); got != 3 {
+		t.Fatalf("unexpected pending jobs before release: %d", got)
+	}
+
+	close(release)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if pool.PendingJobs() == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pending jobs did not drain")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestQueueJobErrReturnsQueueFull(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -183,11 +245,18 @@ func TestStopContextTimesOut(t *testing.T) {
 	if err := pool.StopContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded, got %v", err)
 	}
+	select {
+	case <-pool.Done():
+		t.Fatal("pool shutdown completed before the running job was released")
+	default:
+	}
 
 	close(release)
 
-	if err := pool.StopContext(context.Background()); err != nil {
-		t.Fatalf("unexpected stop error: %v", err)
+	select {
+	case <-pool.Done():
+	case <-time.After(time.Second):
+		t.Fatal("pool shutdown did not complete")
 	}
 }
 
